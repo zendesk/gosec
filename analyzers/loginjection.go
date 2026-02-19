@@ -58,6 +58,21 @@ func LogInjection() taint.Config {
 			{Package: "strconv", Method: "Quote"},
 			// url.QueryEscape encodes special characters
 			{Package: "net/url", Method: "QueryEscape"},
+
+			// JSON encoding escapes all special characters including newlines,
+			// producing structurally safe output for log entries.
+			{Package: "encoding/json", Method: "Marshal"},
+			{Package: "encoding/json", Method: "MarshalIndent"},
+
+			// Numeric conversions produce strings that cannot contain
+			// log injection characters (newlines, carriage returns).
+			{Package: "strconv", Method: "Atoi"},
+			{Package: "strconv", Method: "Itoa"},
+			{Package: "strconv", Method: "ParseInt"},
+			{Package: "strconv", Method: "ParseUint"},
+			{Package: "strconv", Method: "ParseFloat"},
+			{Package: "strconv", Method: "FormatInt"},
+			{Package: "strconv", Method: "FormatFloat"},
 		},
 	}
 }

@@ -57,7 +57,7 @@ govulncheck: install-govulncheck
 	fi
 
 test-coverage:
-	go test -race -v -count=1 -coverprofile=coverage.out ./...
+	go test -race -v -count=1 -coverpkg=./... -coverprofile=coverage.out ./...
 
 build:
 	go build $(LDFLAGS) -o $(BIN) ./cmd/gosec/

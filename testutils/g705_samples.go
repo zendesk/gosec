@@ -56,4 +56,34 @@ func staticHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "<h1>Hello World</h1>")
 }
 `}, 0, gosec.NewConfig()},
+	// Test: json.Marshal sanitizer
+	{[]string{`
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+)
+
+func handler(w http.ResponseWriter, r *http.Request) {
+	data := r.FormValue("data")
+	jsonData, _ := json.Marshal(data)
+	w.Write(jsonData)
+}
+`}, 0, gosec.NewConfig()},
+	// Test: strconv sanitizer
+	{[]string{`
+package main
+
+import (
+	"net/http"
+	"strconv"
+)
+
+func handler(w http.ResponseWriter, r *http.Request) {
+	id := r.FormValue("id")
+	num, _ := strconv.Atoi(id)
+	w.Write([]byte(strconv.Itoa(num)))
+}
+`}, 0, gosec.NewConfig()},
 }

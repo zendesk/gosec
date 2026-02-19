@@ -42,4 +42,36 @@ func safeLog() {
 	log.Println("Application started")
 }
 `}, 0, gosec.NewConfig()},
+	// Test: json.Marshal sanitizer
+	{[]string{`
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+)
+
+func handler(r *http.Request) {
+	data := r.FormValue("data")
+	jsonData, _ := json.Marshal(data)
+	log.Printf("Received: %s", jsonData)
+}
+`}, 0, gosec.NewConfig()},
+	// Test: strconv sanitizer
+	{[]string{`
+package main
+
+import (
+	"log"
+	"net/http"
+	"strconv"
+)
+
+func handler(r *http.Request) {
+	id := r.FormValue("id")
+	num, _ := strconv.Atoi(id)
+	log.Printf("Processing ID: %d", num)
+}
+`}, 0, gosec.NewConfig()},
 }

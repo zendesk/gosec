@@ -58,6 +58,23 @@ func XSS() taint.Config {
 			// url.QueryEscape for URL parameter escaping
 			{Package: "net/url", Method: "QueryEscape"},
 			{Package: "net/url", Method: "PathEscape"},
+
+			// JSON encoding produces structurally safe output that cannot
+			// contain unescaped HTML tags or script injections. The output
+			// is served as application/json, not text/html.
+			{Package: "encoding/json", Method: "Marshal"},
+			{Package: "encoding/json", Method: "MarshalIndent"},
+
+			// Integer/float conversions produce numeric strings that cannot
+			// contain XSS payloads.
+			{Package: "strconv", Method: "Atoi"},
+			{Package: "strconv", Method: "Itoa"},
+			{Package: "strconv", Method: "ParseInt"},
+			{Package: "strconv", Method: "ParseUint"},
+			{Package: "strconv", Method: "ParseFloat"},
+			{Package: "strconv", Method: "FormatInt"},
+			{Package: "strconv", Method: "FormatUint"},
+			{Package: "strconv", Method: "FormatFloat"},
 		},
 	}
 }

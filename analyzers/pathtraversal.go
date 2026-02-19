@@ -71,6 +71,20 @@ func PathTraversal() taint.Config {
 			{Package: "path/filepath", Method: "Rel"},
 			// url.PathEscape escapes path components
 			{Package: "net/url", Method: "PathEscape"},
+
+			// path.Base and path.Clean provide identical traversal-stripping
+			// semantics as their filepath counterparts (the only difference is
+			// separator handling, which is irrelevant for security).
+			{Package: "path", Method: "Base"},
+			{Package: "path", Method: "Clean"},
+
+			// Integer conversions eliminate path traversal vectors entirely —
+			// the result can never contain "/" or ".." characters.
+			{Package: "strconv", Method: "Atoi"},
+			{Package: "strconv", Method: "ParseInt"},
+			{Package: "strconv", Method: "ParseUint"},
+			{Package: "strconv", Method: "ParseFloat"},
+			{Package: "strconv", Method: "ParseBool"},
 		},
 	}
 }

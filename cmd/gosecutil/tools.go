@@ -76,13 +76,11 @@ func (u *utilities) run(args ...string) {
 func shouldSkip(path string) bool {
 	st, e := os.Stat(path) // #nosec G703 -- gosecutil intentionally inspects user-supplied local file paths
 	if e != nil {
-		//#nosec
-		fmt.Fprintf(os.Stderr, "Skipping: %s - %s\n", path, e)
+		fmt.Fprintf(os.Stderr, "Skipping: %s - %s\n", path, e) //#nosec G705
 		return true
 	}
 	if st.IsDir() {
-		//#nosec
-		fmt.Fprintf(os.Stderr, "Skipping: %s - directory\n", path)
+		fmt.Fprintf(os.Stderr, "Skipping: %s - directory\n", path) //#nosec G705
 		return true
 	}
 	return false
@@ -135,7 +133,9 @@ func createContext(filename string) *context {
 		Scopes:     make(map[ast.Node]*types.Scope),
 		Implicits:  make(map[ast.Node]types.Object),
 	}
-	config := types.Config{Importer: importer.Default()}
+	// Use ForCompiler with "source" for more reliable import resolution
+	// This reads from source files instead of relying on compiled packages
+	config := types.Config{Importer: importer.ForCompiler(fileset, "source", nil)}
 	pkg, e := config.Check("main.go", fileset, []*ast.File{root}, info)
 	if e != nil {
 		//#nosec

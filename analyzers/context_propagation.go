@@ -234,7 +234,7 @@ func (s *contextPropagationState) detectLostCancel(fn *ssa.Function) {
 				continue
 			}
 
-			if !isCancelCalled(cancelValue) {
+			if !isCancelCalled(cancelValue, s.ssaFuncs) {
 				s.addIssue(instr.Pos(), msgLostCancel, issue.Medium, issue.High)
 			}
 		}
@@ -673,7 +673,7 @@ func isCancelFuncType(t types.Type) bool {
 	return true
 }
 
-func isCancelCalled(cancelValue ssa.Value) bool {
+func isCancelCalled(cancelValue ssa.Value, allFuncs []*ssa.Function) bool {
 	if cancelValue == nil {
 		return false
 	}
@@ -699,6 +699,13 @@ func isCancelCalled(cancelValue ssa.Value) bool {
 				if r.Val != current {
 					continue
 				}
+				// Check if storing to a struct field — if so, search other
+				// methods of the same type for loads of that field + call.
+				if fa, ok := r.Addr.(*ssa.FieldAddr); ok {
+					if isCancelCalledViaStructField(fa, allFuncs) {
+						return true
+					}
+				}
 				queue = append(queue, r.Addr)
 			case *ssa.UnOp:
 				if r.Op == token.MUL && r.X == current {
@@ -722,6 +729,136 @@ func isCancelCalled(cancelValue ssa.Value) bool {
 		}
 	}
 
+	return false
+}
+
+// isCancelCalledViaStructField checks whether a cancel function stored into a
+// struct field (e.g., job.cancelFn = cancel) is subsequently called in any other
+// method of the same receiver type (e.g., job.Close() calls job.cancelFn()).
+func isCancelCalledViaStructField(storeFA *ssa.FieldAddr, allFuncs []*ssa.Function) bool {
+	// Get the field index and the receiver pointer type
+	fieldIdx := storeFA.Field
+	structPtrType := storeFA.X.Type()
+
+	for _, fn := range allFuncs {
+		if fn == nil || fn.Blocks == nil {
+			continue
+		}
+		// Only check methods on the same receiver type
+		if fn.Signature == nil || fn.Signature.Recv() == nil {
+			continue
+		}
+		if !types.Identical(fn.Signature.Recv().Type(), structPtrType) {
+			continue
+		}
+
+		// Look for a load of the same field followed by a call
+		for _, block := range fn.Blocks {
+			for _, instr := range block.Instrs {
+				fa, ok := instr.(*ssa.FieldAddr)
+				if !ok || fa.Field != fieldIdx {
+					continue
+				}
+				// Check that this FieldAddr is on the receiver (Params[0])
+				if len(fn.Params) == 0 {
+					continue
+				}
+				if !reachesParam(fa.X, fn.Params[0]) {
+					continue
+				}
+				// Check if the value loaded from this field is eventually called
+				if isFieldValueCalled(fa) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// reachesParam checks if a value traces back to the given parameter,
+// following through pointer dereferences and phi nodes.
+func reachesParam(v ssa.Value, param *ssa.Parameter) bool {
+	seen := make(map[ssa.Value]bool)
+	return reachesParamImpl(v, param, seen)
+}
+
+func reachesParamImpl(v ssa.Value, param *ssa.Parameter, seen map[ssa.Value]bool) bool {
+	if v == nil || seen[v] {
+		return false
+	}
+	seen[v] = true
+
+	if v == param {
+		return true
+	}
+	switch val := v.(type) {
+	case *ssa.UnOp:
+		return reachesParamImpl(val.X, param, seen)
+	case *ssa.Phi:
+		for _, e := range val.Edges {
+			if reachesParamImpl(e, param, seen) {
+				return true
+			}
+		}
+	case *ssa.FieldAddr:
+		return reachesParamImpl(val.X, param, seen)
+	}
+	return false
+}
+
+// isFieldValueCalled checks if the value loaded from a FieldAddr is eventually
+// used as a callee (i.e., the loaded function pointer is called).
+func isFieldValueCalled(fa *ssa.FieldAddr) bool {
+	refs := fa.Referrers()
+	if refs == nil {
+		return false
+	}
+	for _, ref := range *refs {
+		// Look for a load (UnOp MUL = pointer dereference)
+		unop, ok := ref.(*ssa.UnOp)
+		if !ok || unop.Op != token.MUL {
+			continue
+		}
+		// Check if the loaded value is called
+		loadRefs := unop.Referrers()
+		if loadRefs == nil {
+			continue
+		}
+		queue := []ssa.Value{unop}
+		visited := make(map[ssa.Value]bool)
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			if cur == nil || visited[cur] {
+				continue
+			}
+			visited[cur] = true
+			curRefs := cur.Referrers()
+			if curRefs == nil {
+				continue
+			}
+			for _, r := range *curRefs {
+				switch rr := r.(type) {
+				case ssa.CallInstruction:
+					if isUsedInCall(rr.Common(), cur) {
+						return true
+					}
+				case *ssa.Phi:
+					queue = append(queue, rr)
+				case *ssa.Store:
+					// stored then loaded elsewhere — follow addr
+					if rr.Val == cur {
+						queue = append(queue, rr.Addr)
+					}
+				case *ssa.UnOp:
+					if rr.X == cur {
+						queue = append(queue, rr)
+					}
+				}
+			}
+		}
+	}
 	return false
 }
 

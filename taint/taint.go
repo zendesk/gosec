@@ -413,26 +413,51 @@ func (a *Analyzer) isTainted(v ssa.Value, fn *ssa.Function, visited map[ssa.Valu
 			if val.Call.Value != nil && a.isTainted(val.Call.Value, fn, visited, depth+1) {
 				return true
 			}
+			// Also check non-receiver args for interface method calls
+			for _, arg := range val.Call.Args {
+				if a.isTainted(arg, fn, visited, depth+1) {
+					return true
+				}
+			}
 		} else if callee := val.Call.StaticCallee(); callee != nil && callee.Signature.Recv() != nil {
 			// Static method call — receiver is Args[0]
 			if len(val.Call.Args) > 0 && a.isTainted(val.Call.Args[0], fn, visited, depth+1) {
 				return true
 			}
-		}
-
-		// For non-method calls (plain functions), check if data-carrying arguments are tainted.
-		// This handles type conversions (string(tainted)), fmt.Sprintf(tainted), etc.
-		//
-		// IMPORTANT: We only propagate taint through arguments for functions that
-		// transform data (conversions, formatting, string ops). We do NOT propagate
-		// taint just because a function receives a tainted argument — the function
-		// must actually return a value derived from that argument.
-		if callee := val.Call.StaticCallee(); callee != nil {
-			if callee.Signature.Recv() == nil {
-				// Package-level function — check if any arg is tainted
-				for _, arg := range val.Call.Args {
+			// Also check non-receiver arguments (Args[1:]) for methods.
+			// For internal methods with bodies, use interprocedural analysis.
+			// For external methods, conservatively propagate any tainted arg.
+			if len(callee.Blocks) > 0 {
+				if a.doTaintedArgsFlowToReturn(val, callee, fn, visited, depth+1) {
+					return true
+				}
+			} else if len(val.Call.Args) > 1 {
+				for _, arg := range val.Call.Args[1:] {
 					if a.isTainted(arg, fn, visited, depth+1) {
 						return true
+					}
+				}
+			}
+		}
+
+		// For non-method calls (plain functions), check if data-carrying arguments
+		// are tainted AND actually flow to the return value.
+		if callee := val.Call.StaticCallee(); callee != nil {
+			if callee.Signature.Recv() == nil {
+				if len(callee.Blocks) > 0 {
+					// Internal function with available body — use interprocedural
+					// analysis to check if tainted args actually influence the return.
+					if a.doTaintedArgsFlowToReturn(val, callee, fn, visited, depth+1) {
+						return true
+					}
+				} else {
+					// External function (no body) — conservatively assume any
+					// tainted arg taints the return. This is correct for stdlib
+					// data-transformation functions (string ops, fmt, etc.).
+					for _, arg := range val.Call.Args {
+						if a.isTainted(arg, fn, visited, depth+1) {
+							return true
+						}
 					}
 				}
 			}
@@ -448,8 +473,10 @@ func (a *Analyzer) isTainted(v ssa.Value, fn *ssa.Function, visited map[ssa.Valu
 		}
 
 	case *ssa.FieldAddr:
-		// Field access on a tainted struct
-		return a.isTainted(val.X, fn, visited, depth+1)
+		// Field access on a struct — use field-sensitive analysis.
+		// Instead of blindly propagating taint from the parent struct, we
+		// check whether this specific field carries tainted data.
+		return a.isFieldAccessTainted(val, fn, visited, depth+1)
 
 	case *ssa.IndexAddr:
 		// Index into a tainted slice/array
@@ -741,6 +768,478 @@ func (a *Analyzer) isFreeVarTainted(fv *ssa.FreeVar, fn *ssa.Function, visited m
 	}
 
 	return false
+}
+
+// isFieldAccessTainted checks whether a specific field of a struct carries tainted data.
+//
+// This is the core of field-sensitive taint tracking. Rather than treating
+// the entire struct as tainted when any field is tainted, we trace the
+// specific field to see if IT was assigned tainted data.
+func (a *Analyzer) isFieldAccessTainted(fa *ssa.FieldAddr, fn *ssa.Function, visited map[ssa.Value]bool, depth int) bool {
+	if depth > maxTaintDepth {
+		return false
+	}
+
+	// CASE 1: The struct is a parameter of a known source type (e.g., *http.Request).
+	// ALL fields of externally-supplied source types are considered tainted.
+	if a.isSourceType(fa.X.Type()) {
+		if _, ok := fa.X.(*ssa.Parameter); ok {
+			return true
+		}
+		// If not a parameter but still a source type, trace the struct origin
+		if a.isTainted(fa.X, fn, visited, depth) {
+			return true
+		}
+		return false
+	}
+
+	// CASE 2: The struct was returned by a function call.
+	// Use interprocedural analysis: look inside the callee to see if this
+	// specific field index was assigned tainted data.
+	if call, ok := fa.X.(*ssa.Call); ok {
+		if callee := call.Call.StaticCallee(); callee != nil && callee.Blocks != nil {
+			return a.isFieldTaintedViaCall(call, fa.Field, callee, fn, visited, depth)
+		}
+		// External function — fall back to checking if the call result is tainted
+		return a.isTainted(fa.X, fn, visited, depth)
+	}
+
+	// CASE 3: The struct is from an Extract (multi-return call, e.g., job, err := NewJob(...)).
+	if extract, ok := fa.X.(*ssa.Extract); ok {
+		if call, ok := extract.Tuple.(*ssa.Call); ok {
+			if callee := call.Call.StaticCallee(); callee != nil && callee.Blocks != nil {
+				return a.isFieldTaintedViaCall(call, fa.Field, callee, fn, visited, depth)
+			}
+		}
+		// Fall back
+		return a.isTainted(fa.X, fn, visited, depth)
+	}
+
+	// CASE 4: The struct is a local Alloc. Check stores to this specific field.
+	if alloc, ok := fa.X.(*ssa.Alloc); ok {
+		return a.isFieldOfAllocTainted(alloc, fa.Field, fn, visited, depth)
+	}
+
+	// CASE 5: Pointer dereference (load) — trace through the pointer.
+	if unop, ok := fa.X.(*ssa.UnOp); ok {
+		return a.isFieldAccessOnPointerTainted(unop, fa.Field, fn, visited, depth)
+	}
+
+	// CASE 6: Phi node — field is tainted if tainted on any incoming edge.
+	if phi, ok := fa.X.(*ssa.Phi); ok {
+		for _, edge := range phi.Edges {
+			if a.isFieldTaintedOnValue(edge, fa.Field, fn, visited, depth+1) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// CASE 7: Nested field access — e.g., job.Rinse.Something
+	if innerFA, ok := fa.X.(*ssa.FieldAddr); ok {
+		return a.isFieldAccessTainted(innerFA, fn, visited, depth)
+	}
+
+	// Default: fall back to checking if the parent struct value is tainted.
+	return a.isTainted(fa.X, fn, visited, depth)
+}
+
+// isFieldTaintedOnValue checks if a specific field of a value is tainted.
+func (a *Analyzer) isFieldTaintedOnValue(v ssa.Value, fieldIdx int, fn *ssa.Function, visited map[ssa.Value]bool, depth int) bool {
+	if v == nil || depth > maxTaintDepth {
+		return false
+	}
+
+	switch val := v.(type) {
+	case *ssa.Call:
+		if callee := val.Call.StaticCallee(); callee != nil && callee.Blocks != nil {
+			return a.isFieldTaintedViaCall(val, fieldIdx, callee, fn, visited, depth)
+		}
+		return a.isTainted(v, fn, visited, depth)
+	case *ssa.Extract:
+		if call, ok := val.Tuple.(*ssa.Call); ok {
+			if callee := call.Call.StaticCallee(); callee != nil && callee.Blocks != nil {
+				return a.isFieldTaintedViaCall(call, fieldIdx, callee, fn, visited, depth)
+			}
+		}
+		return a.isTainted(v, fn, visited, depth)
+	case *ssa.Alloc:
+		return a.isFieldOfAllocTainted(val, fieldIdx, fn, visited, depth)
+	case *ssa.Phi:
+		for _, edge := range val.Edges {
+			if a.isFieldTaintedOnValue(edge, fieldIdx, fn, visited, depth+1) {
+				return true
+			}
+		}
+		return false
+	default:
+		return a.isTainted(v, fn, visited, depth)
+	}
+}
+
+// isFieldOfAllocTainted checks if a specific field of a locally-allocated struct
+// has been assigned tainted data.
+func (a *Analyzer) isFieldOfAllocTainted(alloc *ssa.Alloc, fieldIdx int, fn *ssa.Function, visited map[ssa.Value]bool, depth int) bool {
+	if alloc.Referrers() == nil {
+		return false
+	}
+	for _, ref := range *alloc.Referrers() {
+		fa, ok := ref.(*ssa.FieldAddr)
+		if !ok || fa.Field != fieldIdx {
+			continue
+		}
+
+		if fa.Referrers() == nil {
+			continue
+		}
+		for _, faRef := range *fa.Referrers() {
+			store, ok := faRef.(*ssa.Store)
+			if !ok || store.Addr != fa {
+				continue
+			}
+			if a.isTainted(store.Val, fn, visited, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isFieldAccessOnPointerTainted handles field access through a pointer dereference.
+func (a *Analyzer) isFieldAccessOnPointerTainted(unop *ssa.UnOp, fieldIdx int, fn *ssa.Function, visited map[ssa.Value]bool, depth int) bool {
+	// Trace through the pointer to find the underlying value
+	return a.isFieldTaintedOnValue(unop.X, fieldIdx, fn, visited, depth)
+}
+
+// isFieldTaintedViaCall performs interprocedural analysis to check if a specific
+// field of the struct returned by a function call is tainted.
+//
+// It looks inside the callee to find the returned struct allocation and checks
+// whether the specific field was assigned data derived from tainted arguments.
+func (a *Analyzer) isFieldTaintedViaCall(call *ssa.Call, fieldIdx int, callee *ssa.Function, callerFn *ssa.Function, visited map[ssa.Value]bool, depth int) bool {
+	if depth > maxTaintDepth || callee == nil {
+		return false
+	}
+
+	// If we don't have SSA blocks (external function or no body), use fallback logic:
+	// Assume the field is tainted if any argument to the constructor is tainted.
+	if callee.Blocks == nil {
+		for _, arg := range call.Call.Args {
+			if a.isTainted(arg, callerFn, visited, depth) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Find all Return instructions in the callee
+	for _, block := range callee.Blocks {
+		for _, instr := range block.Instrs {
+			ret, ok := instr.(*ssa.Return)
+			if !ok {
+				continue
+			}
+			// Check each return value for our struct
+			for _, retVal := range ret.Results {
+				alloc := traceToAlloc(retVal)
+				if alloc == nil {
+					continue
+				}
+				// Check stores to this alloc's field at fieldIdx
+				if a.isFieldOfAllocTaintedInCallee(alloc, fieldIdx, callee, call, callerFn, visited, depth+1) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// isFieldOfAllocTaintedInCallee checks if a specific field of an allocated struct
+// (inside a callee function) receives tainted data from the caller's arguments.
+func (a *Analyzer) isFieldOfAllocTaintedInCallee(alloc *ssa.Alloc, fieldIdx int, callee *ssa.Function, call *ssa.Call, callerFn *ssa.Function, visited map[ssa.Value]bool, depth int) bool {
+	if alloc.Referrers() == nil || depth > maxTaintDepth {
+		return false
+	}
+	for _, ref := range *alloc.Referrers() {
+		fa, ok := ref.(*ssa.FieldAddr)
+		if !ok || fa.Field != fieldIdx {
+			continue
+		}
+		if fa.Referrers() == nil {
+			continue
+		}
+		for _, faRef := range *fa.Referrers() {
+			store, ok := faRef.(*ssa.Store)
+			if !ok || store.Addr != fa {
+				continue
+			}
+			// Check if the stored value traces back to a tainted caller argument.
+			// Map callee parameters back to caller arguments.
+			if a.isCalleValueTainted(store.Val, callee, call, callerFn, visited, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isCalleValueTainted checks if a value inside a callee is tainted, mapping
+// callee parameters back to the actual caller arguments for interprocedural analysis.
+func (a *Analyzer) isCalleValueTainted(v ssa.Value, callee *ssa.Function, call *ssa.Call, callerFn *ssa.Function, visited map[ssa.Value]bool, depth int) bool {
+	if v == nil || depth > maxTaintDepth {
+		return false
+	}
+
+	// If the value is a callee parameter, map it to the caller's argument
+	if param, ok := v.(*ssa.Parameter); ok {
+		for i, p := range callee.Params {
+			if p == param && i < len(call.Call.Args) {
+				return a.isTainted(call.Call.Args[i], callerFn, visited, depth)
+			}
+		}
+		return false
+	}
+
+	// For constants, never tainted
+	if _, ok := v.(*ssa.Const); ok {
+		return false
+	}
+
+	// For calls within the callee, check if any tainted param flows in
+	if innerCall, ok := v.(*ssa.Call); ok {
+		// Check if it's a sanitizer
+		if a.isSanitizerCall(innerCall) {
+			return false
+		}
+		if a.isSourceFuncCall(innerCall) {
+			return true
+		}
+		for _, arg := range innerCall.Call.Args {
+			if a.isCalleValueTainted(arg, callee, call, callerFn, visited, depth+1) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// For Extract (tuple unpacking), trace the tuple
+	if extract, ok := v.(*ssa.Extract); ok {
+		return a.isCalleValueTainted(extract.Tuple, callee, call, callerFn, visited, depth+1)
+	}
+
+	// For Phi, check all edges
+	if phi, ok := v.(*ssa.Phi); ok {
+		for _, edge := range phi.Edges {
+			if a.isCalleValueTainted(edge, callee, call, callerFn, visited, depth+1) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// For BinOp, check both sides
+	if binop, ok := v.(*ssa.BinOp); ok {
+		return a.isCalleValueTainted(binop.X, callee, call, callerFn, visited, depth+1) ||
+			a.isCalleValueTainted(binop.Y, callee, call, callerFn, visited, depth+1)
+	}
+
+	// For Convert/ChangeType, trace through
+	if conv, ok := v.(*ssa.Convert); ok {
+		return a.isCalleValueTainted(conv.X, callee, call, callerFn, visited, depth+1)
+	}
+	if ct, ok := v.(*ssa.ChangeType); ok {
+		return a.isCalleValueTainted(ct.X, callee, call, callerFn, visited, depth+1)
+	}
+
+	// For FieldAddr on a callee parameter (e.g., accessing a field of an arg struct)
+	if fa, ok := v.(*ssa.FieldAddr); ok {
+		return a.isCalleValueTainted(fa.X, callee, call, callerFn, visited, depth+1)
+	}
+
+	// For UnOp (pointer deref), trace through
+	if unop, ok := v.(*ssa.UnOp); ok {
+		return a.isCalleValueTainted(unop.X, callee, call, callerFn, visited, depth+1)
+	}
+
+	// For other SSA values, fall back to the callee-local taint check
+	return a.isTainted(v, callee, visited, depth)
+}
+
+// doTaintedArgsFlowToReturn checks if any tainted argument to an internal function
+// call actually influences the function's return value(s).
+//
+// This prevents false positives from constructor-like functions (e.g., NewJob)
+// where only some arguments flow into the return struct, while others are stored
+// in fields that don't affect the data being tracked.
+func (a *Analyzer) doTaintedArgsFlowToReturn(call *ssa.Call, callee *ssa.Function, callerFn *ssa.Function, visited map[ssa.Value]bool, depth int) bool {
+	if depth > maxTaintDepth {
+		return false
+	}
+
+	// Identify which args are tainted
+	var taintedArgIndices []int
+	for i, arg := range call.Call.Args {
+		if a.isTainted(arg, callerFn, visited, depth) {
+			taintedArgIndices = append(taintedArgIndices, i)
+		}
+	}
+	if len(taintedArgIndices) == 0 {
+		return false
+	}
+
+	// Build a set of callee parameters that correspond to tainted caller args
+	taintedParams := make(map[*ssa.Parameter]bool)
+	for _, idx := range taintedArgIndices {
+		if idx < len(callee.Params) {
+			taintedParams[callee.Params[idx]] = true
+		}
+	}
+
+	// Check if any tainted parameter flows to a Return instruction
+	for _, block := range callee.Blocks {
+		for _, instr := range block.Instrs {
+			ret, ok := instr.(*ssa.Return)
+			if !ok {
+				continue
+			}
+			for _, retVal := range ret.Results {
+				if a.valueReachableFromParams(retVal, taintedParams, make(map[ssa.Value]bool), 0) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// valueReachableFromParams checks if a value in a function is data-derived from
+// any of the specified parameters. This is a lightweight reachability check
+// within a single function body.
+func (a *Analyzer) valueReachableFromParams(v ssa.Value, taintedParams map[*ssa.Parameter]bool, visited map[ssa.Value]bool, depth int) bool {
+	if v == nil || depth > 30 || visited[v] {
+		return false
+	}
+	visited[v] = true
+
+	switch val := v.(type) {
+	case *ssa.Parameter:
+		return taintedParams[val]
+	case *ssa.Const:
+		return false
+	case *ssa.Global:
+		return false
+	case *ssa.Alloc:
+		// Check if any store to this alloc uses tainted data
+		if val.Referrers() == nil {
+			return false
+		}
+		for _, ref := range *val.Referrers() {
+			if store, ok := ref.(*ssa.Store); ok && store.Addr == val {
+				if a.valueReachableFromParams(store.Val, taintedParams, visited, depth+1) {
+					return true
+				}
+			}
+			// Also check FieldAddr stores (for struct allocs)
+			if fa, ok := ref.(*ssa.FieldAddr); ok {
+				if fa.Referrers() != nil {
+					for _, faRef := range *fa.Referrers() {
+						if store, ok := faRef.(*ssa.Store); ok && store.Addr == fa {
+							if a.valueReachableFromParams(store.Val, taintedParams, visited, depth+1) {
+								return true
+							}
+						}
+					}
+				}
+			}
+		}
+		return false
+	case *ssa.Call:
+		// Check if any arg to this call comes from tainted params
+		for _, arg := range val.Call.Args {
+			if a.valueReachableFromParams(arg, taintedParams, visited, depth+1) {
+				return true
+			}
+		}
+		if val.Call.Value != nil {
+			if a.valueReachableFromParams(val.Call.Value, taintedParams, visited, depth+1) {
+				return true
+			}
+		}
+		return false
+	case *ssa.Phi:
+		for _, edge := range val.Edges {
+			if a.valueReachableFromParams(edge, taintedParams, visited, depth+1) {
+				return true
+			}
+		}
+		return false
+	case *ssa.UnOp:
+		return a.valueReachableFromParams(val.X, taintedParams, visited, depth+1)
+	case *ssa.BinOp:
+		return a.valueReachableFromParams(val.X, taintedParams, visited, depth+1) ||
+			a.valueReachableFromParams(val.Y, taintedParams, visited, depth+1)
+	case *ssa.Convert:
+		return a.valueReachableFromParams(val.X, taintedParams, visited, depth+1)
+	case *ssa.ChangeType:
+		return a.valueReachableFromParams(val.X, taintedParams, visited, depth+1)
+	case *ssa.MakeInterface:
+		return a.valueReachableFromParams(val.X, taintedParams, visited, depth+1)
+	case *ssa.TypeAssert:
+		return a.valueReachableFromParams(val.X, taintedParams, visited, depth+1)
+	case *ssa.Slice:
+		return a.valueReachableFromParams(val.X, taintedParams, visited, depth+1)
+	case *ssa.FieldAddr:
+		return a.valueReachableFromParams(val.X, taintedParams, visited, depth+1)
+	case *ssa.IndexAddr:
+		return a.valueReachableFromParams(val.X, taintedParams, visited, depth+1)
+	case *ssa.Extract:
+		return a.valueReachableFromParams(val.Tuple, taintedParams, visited, depth+1)
+	case *ssa.FreeVar:
+		return false // Conservative: closures don't flow from params
+	case *ssa.Lookup:
+		return a.valueReachableFromParams(val.X, taintedParams, visited, depth+1)
+	default:
+		return false // Unknown SSA type — conservative, don't propagate
+	}
+}
+
+// traceToAlloc follows a value back through SSA instructions to find
+// the underlying Alloc instruction (struct allocation), if any.
+func traceToAlloc(v ssa.Value) *ssa.Alloc {
+	seen := make(map[ssa.Value]bool)
+	return traceToAllocImpl(v, seen)
+}
+
+func traceToAllocImpl(v ssa.Value, seen map[ssa.Value]bool) *ssa.Alloc {
+	if v == nil || seen[v] {
+		return nil
+	}
+	seen[v] = true
+
+	switch val := v.(type) {
+	case *ssa.Alloc:
+		return val
+	case *ssa.Phi:
+		for _, e := range val.Edges {
+			if a := traceToAllocImpl(e, seen); a != nil {
+				return a
+			}
+		}
+		return nil
+	case *ssa.MakeInterface:
+		return traceToAllocImpl(val.X, seen)
+	case *ssa.ChangeType:
+		return traceToAllocImpl(val.X, seen)
+	case *ssa.Convert:
+		return traceToAllocImpl(val.X, seen)
+	case *ssa.UnOp:
+		return traceToAllocImpl(val.X, seen)
+	default:
+		return nil
+	}
 }
 
 // buildPath constructs the call path from entry point to the sink.

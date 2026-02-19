@@ -99,4 +99,36 @@ func safeHandler(r *http.Request) {
 	os.Open(cleaned)
 }
 `}, 0, gosec.NewConfig()},
+	// Test: path.Base sanitizer
+	{[]string{`
+package main
+
+import (
+	"net/http"
+	"os"
+	"path"
+)
+
+func handler(r *http.Request) {
+	userFile := r.FormValue("file")
+	safe := path.Base(userFile)
+	os.Open(safe)
+}
+`}, 0, gosec.NewConfig()},
+	// Test: strconv sanitizer
+	{[]string{`
+package main
+
+import (
+	"net/http"
+	"os"
+	"strconv"
+)
+
+func handler(r *http.Request) {
+	id := r.FormValue("id")
+	num, _ := strconv.Atoi(id)
+	os.Open("/tmp/file" + strconv.Itoa(num))
+}
+`}, 0, gosec.NewConfig()},
 }
