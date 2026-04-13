@@ -59,3 +59,4 @@ func NewSlowloris(id string, _ gosec.Config) (gosec.Rule, []ast.Node) {
 		MetaData: issue.NewMetaData(id, "Potential Slowloris Attack because ReadHeaderTimeout is not configured in the http.Server", issue.Medium, issue.Low),
 	}, []ast.Node{(*ast.CompositeLit)(nil)}
 }
+// trigger workflow check
